@@ -1,0 +1,254 @@
+name: Sync & Apply Strix Halo Patches
+
+on:
+  schedule:
+    # Patches repo refreshes at :00 every 12h. We run 30 min later to pick up the latest.
+    - cron: "30 2,14 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  issues: write
+
+concurrency:
+  group: strix-halo-sync
+  cancel-in-progress: false
+
+env:
+  CACHYLLAMA_REPO: fewtarius/CachyLLama
+  CACHYLLAMA_BRANCH: master
+  PATCHES_REPO: gaetan-puleo/llama-cpp-strix-halo-patches
+  COMBINED_PATCH: strix-halo-rdna35-combined.patch
+
+jobs:
+  # ──────────────────────────────────────────────────────────────────────────────
+  # Job 1: Rebase our commits onto the latest CachyLLama master.
+  # master is only pushed when the rebase succeeds cleanly.
+  # On conflict: master is left untouched and a GitHub issue is opened.
+  # ──────────────────────────────────────────────────────────────────────────────
+  sync-master:
+    name: Rebase master onto CachyLLama
+    runs-on: ubuntu-latest
+    outputs:
+      updated: ${{ steps.rebase.outputs.updated }}
+
+    steps:
+      - name: Checkout master
+        uses: actions/checkout@v4
+        with:
+          ref: master
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Configure git identity
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Fetch CachyLLama upstream
+        run: |
+          git remote add cachyllama "https://github.com/${CACHYLLAMA_REPO}.git"
+          git fetch --no-tags cachyllama "${CACHYLLAMA_BRANCH}"
+
+      - name: Rebase onto CachyLLama
+        id: rebase
+        run: |
+          set -euo pipefail
+
+          MERGE_BASE=$(git merge-base HEAD "cachyllama/${CACHYLLAMA_BRANCH}")
+          CACHYLLAMA_TIP=$(git rev-parse "cachyllama/${CACHYLLAMA_BRANCH}")
+
+          if [ "$MERGE_BASE" = "$CACHYLLAMA_TIP" ]; then
+            echo "Already up-to-date with CachyLLama — no rebase needed."
+            echo "updated=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          OUR_COUNT=$(git rev-list --count "${MERGE_BASE}..HEAD")
+          echo "Rebasing ${OUR_COUNT} commit(s) onto CachyLLama ${CACHYLLAMA_TIP:0:8} ..."
+
+          if ! git rebase "cachyllama/${CACHYLLAMA_BRANCH}" 2>&1 | tee /tmp/rebase-output.txt; then
+            git rebase --abort 2>/dev/null || true
+            {
+              echo "REBASE_OUTPUT<<REBASE_EOF"
+              cat /tmp/rebase-output.txt
+              echo "REBASE_EOF"
+            } >> "$GITHUB_ENV"
+            exit 1
+          fi
+
+          echo "updated=true" >> "$GITHUB_OUTPUT"
+
+      - name: Push updated master
+        if: steps.rebase.outputs.updated == 'true'
+        run: git push --force-with-lease origin master
+
+      - name: Open issue on rebase failure
+        if: failure()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const output = process.env.REBASE_OUTPUT || '(no output captured)';
+            await github.rest.issues.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title: `[strix-halo-sync] Rebase onto CachyLLama failed — ${new Date().toISOString().slice(0,10)}`,
+              body: [
+                `**Workflow run:** ${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`,
+                '',
+                'Rebasing our commits onto `fewtarius/CachyLLama:master` produced conflicts.',
+                '`master` has **not** been modified. Manual conflict resolution is required.',
+                '',
+                '**git rebase output:**',
+                '```',
+                output.slice(0, 8000),
+                '```',
+              ].join('\n'),
+              labels: ['strix-halo-sync', 'conflict'],
+            });
+
+  # ──────────────────────────────────────────────────────────────────────────────
+  # Job 2: Apply Strix Halo patches on top of (updated) master → strix-halo branch.
+  # Runs a two-stage verification gate before touching the real branch:
+  #   1. git apply --check --3way   (patch applicability)
+  #   2. cmake configure (CPU-only) (build system sanity)
+  # Only pushes strix-halo when both gates pass.
+  # ──────────────────────────────────────────────────────────────────────────────
+  apply-patches:
+    name: Apply Strix Halo patches → strix-halo
+    runs-on: ubuntu-latest
+    needs: sync-master
+
+    steps:
+      - name: Checkout master
+        uses: actions/checkout@v4
+        with:
+          ref: master
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Configure git identity
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Download latest Strix Halo patch
+        run: |
+          set -euo pipefail
+          PATCHES_SHA=$(gh api "repos/${PATCHES_REPO}/commits/HEAD" --jq '.sha')
+          echo "PATCHES_SHA=${PATCHES_SHA}" >> "$GITHUB_ENV"
+
+          PATCH_URL=$(gh api "repos/${PATCHES_REPO}/contents/${COMBINED_PATCH}" --jq '.download_url')
+          curl -fsSL -o /tmp/strix-halo.patch "$PATCH_URL"
+          echo "Patch downloaded: $(wc -l < /tmp/strix-halo.patch) lines (patches@${PATCHES_SHA:0:8})"
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      # Gate 1 — verify the patch applies without conflicts (dry-run, nothing on disk changes)
+      - name: Gate 1 — git apply --check
+        run: |
+          set -euo pipefail
+
+          VERIFY_DIR=$(mktemp -d)
+          git worktree add --detach "$VERIFY_DIR" HEAD
+
+          cleanup() { git worktree remove --force "$VERIFY_DIR" 2>/dev/null || true; rm -rf "$VERIFY_DIR"; }
+          trap cleanup EXIT
+
+          if ! git -C "$VERIFY_DIR" apply --check --3way /tmp/strix-halo.patch 2>&1 | tee /tmp/check-output.txt; then
+            {
+              echo "APPLY_CHECK_OUTPUT<<CHECK_EOF"
+              cat /tmp/check-output.txt
+              echo "CHECK_EOF"
+            } >> "$GITHUB_ENV"
+            echo "::error::Patch does not apply cleanly — see output above."
+            exit 1
+          fi
+
+          echo "Gate 1 passed: patch applies cleanly."
+
+      # Gate 2 — apply in a temporary worktree and run CPU-only cmake configure
+      - name: Gate 2 — CMake configure (CPU-only)
+        run: |
+          set -euo pipefail
+
+          VERIFY_DIR=$(mktemp -d)
+          git worktree add --detach "$VERIFY_DIR" HEAD
+
+          cleanup() { git worktree remove --force "$VERIFY_DIR" 2>/dev/null || true; rm -rf "$VERIFY_DIR"; }
+          trap cleanup EXIT
+
+          # Apply patch to worktree working tree (no --index needed here)
+          git -C "$VERIFY_DIR" apply --3way /tmp/strix-halo.patch
+
+          # Configure without any GPU backend — validates CMakeLists, options, targets
+          cmake \
+            -B "$VERIFY_DIR/build" \
+            -S "$VERIFY_DIR" \
+            -DGGML_HIP=OFF \
+            -DGGML_CUDA=OFF \
+            -DGGML_METAL=OFF \
+            -DCMAKE_BUILD_TYPE=Release \
+            --no-warn-unused-cli \
+            2>&1 | tee /tmp/cmake-output.txt
+
+          CMAKE_EXIT="${PIPESTATUS[0]}"
+          if [ "$CMAKE_EXIT" -ne 0 ]; then
+            {
+              echo "CMAKE_OUTPUT<<CMAKE_EOF"
+              cat /tmp/cmake-output.txt
+              echo "CMAKE_EOF"
+            } >> "$GITHUB_ENV"
+            echo "::error::CMake configure failed — see output above."
+            exit 1
+          fi
+
+          echo "Gate 2 passed: CMake configure succeeded."
+
+      # Both gates passed — apply for real and push
+      - name: Apply patch and push strix-halo
+        run: |
+          set -euo pipefail
+
+          git switch -C strix-halo HEAD
+          git apply --3way --index /tmp/strix-halo.patch
+          git commit \
+            -m "strix-halo: apply RDNA3.5 patches [patches@${PATCHES_SHA:0:8}]" \
+            -m "Source: gaetan-puleo/llama-cpp-strix-halo-patches@${PATCHES_SHA}" \
+            -m "Applied on top of: $(git rev-parse --short HEAD~1) (master)"
+          git push --force origin strix-halo
+
+          echo "strix-halo branch updated successfully."
+
+      - name: Open issue on patch failure
+        if: failure()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const checkOutput = process.env.APPLY_CHECK_OUTPUT || '';
+            const cmakeOutput = process.env.CMAKE_OUTPUT || '';
+            const patchesSha = process.env.PATCHES_SHA || 'unknown';
+
+            const sections = [
+              `**Workflow run:** ${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`,
+              '',
+              `**Patches SHA:** \`${patchesSha}\``,
+              '',
+              'A Strix Halo patch verification gate failed. `strix-halo` has **not** been modified and remains at its last working state.',
+              '',
+            ];
+
+            if (checkOutput) {
+              sections.push('**Gate 1 — git apply --check output:**', '```', checkOutput.slice(0, 4000), '```', '');
+            }
+            if (cmakeOutput) {
+              sections.push('**Gate 2 — CMake configure output:**', '```', cmakeOutput.slice(0, 4000), '```', '');
+            }
+
+            await github.rest.issues.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title: `[strix-halo-sync] Patch application failed — ${new Date().toISOString().slice(0,10)}`,
+              body: sections.join('\n'),
+              labels: ['strix-halo-sync', 'conflict'],
+            });
