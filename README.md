@@ -1,3 +1,15 @@
+# llama.cpp — CachyLLama + Strix Halo fork
+
+This is a personal fork that layers two excellent community projects on top of upstream [llama.cpp](https://github.com/ggml-org/llama.cpp):
+
+- **[CachyLLama](https://github.com/fewtarius/CachyLLama)** by [@fewtarius](https://github.com/fewtarius) — persistent SSD-backed KV cache, system prompt caching, hybrid MoE checkpoint restore, user isolation, and APU/iGPU tuning. Outstanding work making agentic LLM workloads viable on lower-spec AMD hardware.
+
+- **[llama-cpp-strix-halo](https://github.com/gaetan-puleo/llama-cpp-strix-halo)** by [@gaetan-puleo](https://github.com/gaetan-puleo) — RDNA3.5 / Strix Halo (`gfx1151`) ROCm tuning patches for `ggml-cuda` kernels (MMVQ, FlashAttention, MMQ, concat). Thorough benchmarking and tuning work specifically for the AMD Ryzen AI MAX / Radeon 8060S platform.
+
+Both sets of patches are tracked automatically via CI and kept current as their respective upstreams evolve. Full credit to both authors for their contributions to the open-source LLM inference ecosystem.
+
+---
+
 # CachyLLama
 
 A fork of [llama.cpp](https://github.com/ggml-org/llama.cpp) focused on running local LLM inference on lower-spec hardware - AMD APUs, integrated GPUs, handhelds, anything with shared system memory. CachyLLama adds a persistent on-disk KV cache so agentic AI workloads (where every request re-sends thousands of tokens of system prompt and tool definitions) stay usable when the model has to evaluate prompts on hardware that can only generate 5-20 tokens per second.
