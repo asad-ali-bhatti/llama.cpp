@@ -1,4 +1,4 @@
-# llama.cpp — CachyLLama + Strix Halo fork
+# llama.cpp — CachyLLama + @gaetan-puleo tuning patches
 
 This is a personal fork that layers two excellent community projects on top of upstream [llama.cpp](https://github.com/ggml-org/llama.cpp):
 
