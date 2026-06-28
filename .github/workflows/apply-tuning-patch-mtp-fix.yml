@@ -1,0 +1,110 @@
+name: Apply Strix Halo Patches → strix-halo-ssd-mtp-fix
+
+on:
+  push:
+    branches:
+      - fix/ssd-mtp-cache-restore
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  issues: write
+
+concurrency:
+  group: strix-halo-mtp-fix-sync
+  cancel-in-progress: false
+
+env:
+  PATCHES_REPO: gaetan-puleo/llama-cpp-strix-halo-patches
+  COMBINED_PATCH: strix-halo-rdna35-combined.patch
+
+jobs:
+  apply-patches-mtp-fix:
+    name: Apply Strix Halo patches → strix-halo-ssd-mtp-fix
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout fix/ssd-mtp-cache-restore
+        uses: actions/checkout@v7
+        with:
+          ref: fix/ssd-mtp-cache-restore
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Configure git identity
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Download latest Strix Halo patch
+        run: |
+          set -euo pipefail
+          PATCHES_SHA=$(gh api "repos/${PATCHES_REPO}/commits/HEAD" --jq '.sha')
+          echo "PATCHES_SHA=${PATCHES_SHA}" >> "$GITHUB_ENV"
+
+          PATCH_URL=$(gh api "repos/${PATCHES_REPO}/contents/${COMBINED_PATCH}" --jq '.download_url')
+          curl -fsSL -o /tmp/strix-halo.patch "$PATCH_URL"
+          echo "Patch downloaded: $(wc -l < /tmp/strix-halo.patch) lines (patches@${PATCHES_SHA:0:8})"
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Gate — verify patch applies cleanly (dry-run)
+        run: |
+          set -euo pipefail
+
+          VERIFY_DIR=$(mktemp -d)
+          git worktree add --detach "$VERIFY_DIR" HEAD
+
+          cleanup() { git worktree remove --force "$VERIFY_DIR" 2>/dev/null || true; rm -rf "$VERIFY_DIR"; }
+          trap cleanup EXIT
+
+          if ! git -C "$VERIFY_DIR" apply --check --3way /tmp/strix-halo.patch 2>&1 | tee /tmp/check-output.txt; then
+            {
+              echo "APPLY_CHECK_OUTPUT<<CHECK_EOF"
+              cat /tmp/check-output.txt
+              echo "CHECK_EOF"
+            } >> "$GITHUB_ENV"
+            echo "::error::Patch does not apply cleanly onto fix/ssd-mtp-cache-restore — see output above."
+            exit 1
+          fi
+
+          echo "Gate passed: patch applies cleanly onto fix/ssd-mtp-cache-restore."
+
+      - name: Apply patch and push strix-halo-ssd-mtp-fix
+        run: |
+          set -euo pipefail
+
+          git switch -C strix-halo-ssd-mtp-fix HEAD
+          git apply --3way --index /tmp/strix-halo.patch
+          git commit \
+            -m "strix-halo-ssd-mtp-fix: apply RDNA3.5 patches [patches@${PATCHES_SHA:0:8}]" \
+            -m "Source: gaetan-puleo/llama-cpp-strix-halo-patches@${PATCHES_SHA}" \
+            -m "Applied on top of: $(git rev-parse --short HEAD~1) (fix/ssd-mtp-cache-restore)"
+          git push --force origin strix-halo-ssd-mtp-fix
+
+          echo "strix-halo-ssd-mtp-fix updated successfully."
+
+      - name: Open issue on failure
+        if: failure()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const checkOutput = process.env.APPLY_CHECK_OUTPUT || '';
+            const patchesSha = process.env.PATCHES_SHA || 'unknown';
+
+            await github.rest.issues.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title: `[strix-halo-mtp-fix] Patch failed on fix/ssd-mtp-cache-restore — ${new Date().toISOString().slice(0,10)}`,
+              body: [
+                `**Workflow run:** ${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`,
+                '',
+                `**Patches SHA:** \`${patchesSha}\``,
+                '',
+                'Applying Strix Halo patches onto `fix/ssd-mtp-cache-restore` failed.',
+                '`strix-halo-ssd-mtp-fix` has **not** been modified.',
+                '',
+                ...(checkOutput ? ['**git apply --check output:**', '```', checkOutput.slice(0, 6000), '```'] : []),
+              ].join('\n'),
+              labels: ['strix-halo-sync', 'conflict'],
+            });

@@ -4,6 +4,9 @@ on:
   schedule:
     # Patches repo refreshes at :00 every 12h. We run 30 min later to pick up the latest.
     - cron: "30 2,14 * * *"
+  push:
+    branches:
+      - master
   workflow_dispatch:
 
 permissions:
