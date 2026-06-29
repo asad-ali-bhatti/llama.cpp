@@ -1472,6 +1472,19 @@ private:
             // Seed turn counter from max on disk (persistent across restarts)
             ssd_turn_counter = ssd_page_manager->get_max_turn_id() + 1;
 
+            if (params_base.cache_ssd_system_prompts > 0) {
+                sys_cache = std::make_unique<kv_ssd_system_cache>();
+                sys_cache->max_entries = (size_t)params_base.cache_ssd_system_prompts;
+                if (!sys_cache->init(ssd_page_manager->get_base_path(),
+                                     ssd_page_manager->get_compat_hash())) {
+                    SRV_WRN("%s", "SSD system-prompt cache init failed, disabling\n");
+                    sys_cache.reset();
+                } else {
+                    SRV_INF("SSD system-prompt cache enabled: max_entries=%d\n",
+                            params_base.cache_ssd_system_prompts);
+                }
+            }
+
             SRV_INF("SSD cache enabled: path=%s, hot=%d MiB, warm=%d MiB\n",
                     params_base.cache_ssd_path.c_str(),
                     params_base.cache_ssd_hot_ram_mib,

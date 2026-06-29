@@ -162,6 +162,9 @@ public:
     void set_model_info(const struct llama_model* model,
                         int cache_type_k, int cache_type_v);
 
+    uint64_t    get_compat_hash() const { return model_compat_hash_; }
+    const std::string& get_base_path() const { return ssd_base_path_; }
+
     // Max conversations: LRU eviction of entire conversation directories when exceeded.
     // Set before any store/find calls. Default: 16.
     int max_conversations = 16;
