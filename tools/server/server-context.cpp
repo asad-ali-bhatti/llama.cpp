@@ -2532,8 +2532,11 @@ private:
             return;
         }
 
-        // Get the state at the system prompt boundary
-        size_t state_size = llama_state_seq_get_size_ext(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+        // Get the state at the system prompt boundary.
+        // Use NONE (full cache) so that kv_base entries are preserved for
+        // SWA models — PARTIAL_ONLY would drop the full-attention layers and
+        // cause incorrect attention once system-prompt tokens leave the SWA window.
+        size_t state_size = llama_state_seq_get_size_ext(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_NONE);
         if (state_size == 0) {
             slot_sys_hash[slot.id] = 1;
             return;
@@ -2541,7 +2544,7 @@ private:
 
         std::vector<uint8_t> state_data(state_size);
         size_t got = llama_state_seq_get_data_ext(ctx_tgt, state_data.data(),
-            state_size, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+            state_size, slot.id, LLAMA_STATE_SEQ_FLAGS_NONE);
         if (got == 0) {
             slot_sys_hash[slot.id] = 1;
             return;
