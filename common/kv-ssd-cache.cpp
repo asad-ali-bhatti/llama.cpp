@@ -149,7 +149,8 @@ static void ckpt_readahead(kv_ssd_cache* c, uint64_t id) {
 #ifdef __linux__
     posix_fadvise(fd, 0, total_size, POSIX_FADV_WILLNEED);
 #elif defined(__APPLE__)
-    readahead(fd, 0, total_size);
+    struct radvisory ra = { 0, (int)total_size };
+    fcntl(fd, F_RDADVISE, &ra);
 #endif
 
     close(fd);

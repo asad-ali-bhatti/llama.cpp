@@ -8,12 +8,28 @@
 #include "server-task.h"
 #include "llama.h"
 
+#include <cstring>
 #include <vector>
 
 namespace llama {
 
+// On-disk blob format for checkpoints that include a draft (MTP) context.
+// The blob stored by kv_ssd_store is prefixed with this header when ctx_dft
+// was present at save time. Legacy blobs (no header) are detected by the
+// absence of the magic value and treated as tgt-only.
+static constexpr uint32_t SSD_BLOB_MAGIC   = 0x53534454u; // "TDSS"
+static constexpr uint32_t SSD_BLOB_VERSION = 1u;
+
+struct ssd_blob_hdr {
+    uint32_t magic;
+    uint32_t version;
+    uint64_t tgt_size;
+    uint64_t dft_size; // 0 when no draft state was saved
+};
+
 uint64_t server_ssd_cache::store(uint32_t slot_id,
                                  struct llama_context* ctx,
+                                 struct llama_context* ctx_dft,
                                  const common_prompt_checkpoint& ckpt,
                                  const llama_token* tokens,
                                  size_t tokens_size,
@@ -21,21 +37,54 @@ uint64_t server_ssd_cache::store(uint32_t slot_id,
 {
     if (!cache_ || !ctx || !ckpt.data_tgt.data()) return 0;
 
-    // Compute full state (recurrent + KV cache) for cold-start recovery.
-    // The in-memory ckpt.data is PARTIAL_ONLY (recurrent only), but SSD needs
-    // the full state so the attention KV cache is available after cold restart.
-    const size_t full_size = llama_state_seq_get_size_ext(ctx, slot_id, 0);
-    std::vector<uint8_t> full_data(full_size);
-    const size_t n_written = llama_state_seq_get_data_ext(ctx, full_data.data(), full_size, slot_id, 0);
-    if (n_written != full_size) {
-        LOG_WRN("SSD cache: full state serialization size mismatch (expected %zu, got %zu)\n",
-                 full_size, n_written);
+    // Serialize full tgt state (recurrent + KV cache) for cold-start recovery.
+    const size_t tgt_size = llama_state_seq_get_size_ext(ctx, slot_id, 0);
+    std::vector<uint8_t> tgt_data(tgt_size);
+    if (llama_state_seq_get_data_ext(ctx, tgt_data.data(), tgt_size, slot_id, 0) != tgt_size) {
+        LOG_WRN("SSD cache: tgt state serialization size mismatch (slot=%u)\n", slot_id);
         return 0;
     }
 
+    // Serialize dft state when ctx_dft has independent memory (non-shared MTP).
+    std::vector<uint8_t> dft_data;
+    if (ctx_dft) {
+        const size_t dft_size = llama_state_seq_get_size_ext(ctx_dft, slot_id, 0);
+        if (dft_size > 0) {
+            dft_data.resize(dft_size);
+            if (llama_state_seq_get_data_ext(ctx_dft, dft_data.data(), dft_size, slot_id, 0) != dft_size) {
+                LOG_WRN("SSD cache: dft state serialization size mismatch (slot=%u) - skipping\n", slot_id);
+                dft_data.clear();
+            }
+        }
+    }
+
+    // Build combined blob: [ssd_blob_hdr][tgt_data][dft_data]
+    ssd_blob_hdr hdr;
+    hdr.magic    = SSD_BLOB_MAGIC;
+    hdr.version  = SSD_BLOB_VERSION;
+    hdr.tgt_size = (uint64_t)tgt_data.size();
+    hdr.dft_size = (uint64_t)dft_data.size();
+
+    const size_t blob_size = sizeof(hdr) + tgt_data.size() + dft_data.size();
+    std::vector<uint8_t> blob(blob_size);
+    uint8_t* p = blob.data();
+    std::memcpy(p, &hdr, sizeof(hdr));           p += sizeof(hdr);
+    std::memcpy(p, tgt_data.data(), tgt_data.size()); p += tgt_data.size();
+    if (!dft_data.empty()) {
+        std::memcpy(p, dft_data.data(), dft_data.size());
+    }
+
+    // Use live KV-cache query for pos_min/max rather than ckpt.pos_min/max.
+    // The in-memory checkpoint is created with PARTIAL_ONLY (recurrent state
+    // only), so its pos fields reflect the last processed position, not the
+    // actual KV coverage in the blob. Storing the real values here makes logs
+    // accurate and enables future range-validity guards at restore time.
+    const llama_pos real_pos_min = llama_memory_seq_pos_min(llama_get_memory(ctx), (llama_seq_id)slot_id);
+    const llama_pos real_pos_max = llama_memory_seq_pos_max(llama_get_memory(ctx), (llama_seq_id)slot_id);
+
     return kv_ssd_store(cache_, slot_id,
-                        full_data.data(), full_data.size(),
-                        ckpt.pos_min, ckpt.pos_max,
+                        blob.data(), blob.size(),
+                        real_pos_min, real_pos_max,
                         ckpt.n_tokens, turn_id,
                         (const uint32_t*)tokens, tokens_size,
                         cache_->compat_hash);
@@ -45,33 +94,64 @@ bool server_ssd_cache::load(uint64_t checkpoint_id,
                             struct llama_context* ctx,
                             int32_t& out_pos_min,
                             int32_t& out_pos_max,
-                            uint64_t& out_n_tokens)
+                            uint64_t& out_n_tokens,
+                            uint32_t dest_seq_id,
+                            struct llama_context* ctx_dft)
 {
     if (!cache_ || !ctx || checkpoint_id == 0) return false;
 
     const kv_ssd_checkpoint* meta = kv_ssd_get_meta(cache_, checkpoint_id);
     if (!meta) return false;
 
-    // Load data from cache (promotes to hot tier)
-    std::vector<uint8_t> data;
-    if (!kv_ssd_load(cache_, checkpoint_id, data)) return false;
+    std::vector<uint8_t> blob;
+    if (!kv_ssd_load(cache_, checkpoint_id, blob)) return false;
 
-    // Restore full state (recurrent + KV cache) without PARTIAL_ONLY
-    size_t bytes_restored = llama_state_seq_set_data_ext(
-        ctx,
-        data.data(),
-        data.size(),
-        meta->slot_id,
-        0);  // no PARTIAL_ONLY: restore both KV cache and recurrent state
+    const uint32_t seq_id = (dest_seq_id != UINT32_MAX) ? dest_seq_id : meta->slot_id;
 
-    if (bytes_restored == 0) {
-        LOG_WRN("SSD cache: llama_state_seq_set_data_ext failed for checkpoint %lu\n",
-                 (unsigned long)checkpoint_id);
+    // Detect new format (magic header) vs legacy (raw tgt blob).
+    const uint8_t* tgt_ptr  = blob.data();
+    size_t         tgt_bytes = blob.size();
+    const uint8_t* dft_ptr  = nullptr;
+    size_t         dft_bytes = 0;
+
+    if (blob.size() >= sizeof(ssd_blob_hdr)) {
+        ssd_blob_hdr hdr;
+        std::memcpy(&hdr, blob.data(), sizeof(hdr));
+        if (hdr.magic == SSD_BLOB_MAGIC && hdr.version == SSD_BLOB_VERSION) {
+            tgt_ptr  = blob.data() + sizeof(hdr);
+            tgt_bytes = (size_t)hdr.tgt_size;
+            dft_ptr  = tgt_ptr + tgt_bytes;
+            dft_bytes = (size_t)hdr.dft_size;
+
+            if (sizeof(hdr) + tgt_bytes + dft_bytes > blob.size()) {
+                LOG_WRN("SSD cache: blob size mismatch for checkpoint %lu - treating as legacy\n",
+                        (unsigned long)checkpoint_id);
+                tgt_ptr  = blob.data();
+                tgt_bytes = blob.size();
+                dft_ptr  = nullptr;
+                dft_bytes = 0;
+            }
+        }
+    }
+
+    // Restore tgt state (KV cache + recurrent) under the current slot's seq_id.
+    if (llama_state_seq_set_data_ext(ctx, tgt_ptr, tgt_bytes, (int32_t)seq_id, 0) == 0) {
+        LOG_WRN("SSD cache: failed to restore tgt state for checkpoint %lu\n",
+                (unsigned long)checkpoint_id);
         return false;
     }
 
-    out_pos_min = meta->pos_min;
-    out_pos_max = meta->pos_max;
+    // Restore dft state (MTP KV cache) when caller provided ctx_dft.
+    if (ctx_dft && dft_ptr && dft_bytes > 0) {
+        if (llama_state_seq_set_data_ext(ctx_dft, dft_ptr, dft_bytes, (int32_t)seq_id, 0) == 0) {
+            LOG_WRN("SSD cache: failed to restore dft state for checkpoint %lu - MTP will catch up\n",
+                    (unsigned long)checkpoint_id);
+            // Non-fatal: tgt is restored, MTP will degrade gracefully.
+        }
+    }
+
+    out_pos_min  = meta->pos_min;
+    out_pos_max  = meta->pos_max;
     out_n_tokens = meta->n_tokens;
     return true;
 }

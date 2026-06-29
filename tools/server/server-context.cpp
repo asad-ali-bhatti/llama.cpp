@@ -2432,7 +2432,7 @@ private:
         if (ssd_page_manager) {
             const auto & prefix_tokens = slot.prompt.tokens;
             ssd_page_manager->store_checkpoint_with_tokens(
-                slot.id, ctx_tgt, cur,
+                slot.id, ctx_tgt, ctx_dft.get(), cur,
                 prefix_tokens.get_tokens().data(),
                 prefix_tokens.get_tokens().size(),
                 ssd_turn_counter, slot.conv_hash,
@@ -2482,7 +2482,7 @@ private:
                 ? slot.task->tokens.get_tokens()
                 : slot.prompt.tokens.get_tokens();
             ssd_page_manager->store_checkpoint_with_tokens(
-                slot.id, ctx_tgt, cur, prefix_tokens.data(),
+                slot.id, ctx_tgt, ctx_dft.get(), cur, prefix_tokens.data(),
                 prefix_tokens.size(), ssd_turn_counter, slot.conv_hash,
                 slot.task ? slot.task->user_id : std::string());
         }
@@ -3305,8 +3305,11 @@ private:
                                 if (ssd_page_manager->find_and_load_checkpoint(
                                         task_tokens.data(), task_tokens.size(),
                                         ssd_turn_counter, ctx_tgt,
+                                        (uint32_t)slot.id,
                                         ssd_pos_min, ssd_pos_max, ssd_n_tokens,
-                                        slot.conv_hash, 0, (uint64_t)task_tokens.size(), &ssd_lcp)) {
+                                        slot.conv_hash, 0, (uint64_t)task_tokens.size(), &ssd_lcp,
+                                        nullptr, nullptr, std::string(),
+                                        ctx_dft.get())) {
                                     // Push checkpoint's full token count.
                                     // ssd_lcp from find_match is capped at
                                     // KV_SSD_TOKEN_PREFIX_MAX (4096), but
